@@ -5,14 +5,17 @@ Creates external statistic series for energy usage:
 For electric meters:
 - Hourly AMI stats: Verified data from epoch; GraphQL API only returns
   data older than ~2 days (date_to = today - 2 days UTC)
+- 15-minute AMI stats: Same data as hourly but at full 15-minute
+  resolution from the amiEnergyUsages15Min endpoint
 - Interval stats: Near real-time 15-minute data from yesterday midnight UTC,
   picking up seamlessly where hourly data leaves off
 
 For gas meters:
-- Hourly AMI stats only (no interval data available)
+- Hourly AMI stats only (no working endpoint available; the legacy
+  amiEnergyUsages has a server-side DateTimeOffset casting bug)
 
 Import strategy:
-- First refresh: Import ALL available hourly data (epoch to today-2)
+- First refresh: Import ALL available data (epoch to today-2)
 - Midnight refresh: Import all data in 5-day window, continuing cumulative
   sum from before the window (catches backfilled/newly available data)
 - Incremental: Interval stats only (cleared and reimported each time)
@@ -98,10 +101,17 @@ def _resolve_hourly_stat_info(
     return stat_id, fuel, UnitOfEnergy.KILO_WATT_HOUR, "energy", name
 
 
-def _parse_ami_datetime(date_str: str) -> datetime | None:
-    """Parse AMI API date string into a top-of-hour UTC datetime.
+def _parse_ami_datetime(date_str: str, *, truncate_to_hour: bool = True) -> datetime | None:
+    """Parse AMI API date string into a UTC datetime.
 
-    The API returns timestamps like "2026-01-31T23:00:00.000Z".
+    The API returns timestamps like "2026-01-31T23:00:00.000Z" or
+    "2026-01-31T23:15:00.000Z" for 15-minute interval data.
+
+    Args:
+        date_str: ISO-format date string from the API.
+        truncate_to_hour: If True, truncate to top-of-hour for hourly
+            statistics.  If False, preserve the original minute for
+            15-minute resolution statistics.
     """
     try:
         # Strip fractional seconds and handle Z suffix
@@ -111,7 +121,9 @@ def _parse_ami_datetime(date_str: str) -> datetime | None:
         dt = datetime.fromisoformat(clean)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=UTC)
-        return dt.replace(minute=0, second=0, microsecond=0)
+        if truncate_to_hour:
+            return dt.replace(minute=0, second=0, microsecond=0)
+        return dt.replace(second=0, microsecond=0)
     except ValueError:
         _LOGGER.debug("Could not parse AMI date: %s", date_str)
         return None
@@ -172,6 +184,14 @@ async def async_import_all_statistics(
                 force_import_all=force_hourly_import,
                 is_midnight_refresh=is_midnight_refresh,
             )
+            # Also import at 15-minute resolution for granular history
+            await _import_15min_stats_electric(
+                hass,
+                sp,
+                ami_readings,
+                force_import_all=force_hourly_import,
+                is_midnight_refresh=is_midnight_refresh,
+            )
 
     # Import interval read stats (electric only)
     for sp, reads in data.interval_reads.items():
@@ -214,6 +234,169 @@ async def _import_hourly_stats_electric(
             force_import_all=force_import_all,
             is_midnight_refresh=is_midnight_refresh,
         )
+
+
+async def _import_15min_stats_electric(
+    hass: HomeAssistant,
+    service_point: str,
+    readings: list,
+    *,
+    force_import_all: bool = False,
+    is_midnight_refresh: bool = False,
+) -> None:
+    """Import 15-minute resolution AMI stats for electric meters.
+
+    Creates a separate statistic series at 15-minute granularity from the
+    same ``amiEnergyUsages15Min`` data that the hourly stats use.  This
+    preserves the full resolution returned by the API so users can view
+    15-minute detail in HA history.
+
+    Split by direction (consumption / return) like the hourly variant.
+    """
+    await _import_15min_stats(
+        hass,
+        service_point,
+        readings,
+        consumption_only=True,
+        force_import_all=force_import_all,
+        is_midnight_refresh=is_midnight_refresh,
+    )
+
+    has_negative = any(float(r.get("quantity", 0)) < 0 for r in readings)
+    if has_negative:
+        await _import_15min_stats(
+            hass,
+            service_point,
+            readings,
+            return_only=True,
+            force_import_all=force_import_all,
+            is_midnight_refresh=is_midnight_refresh,
+        )
+
+
+async def _import_15min_stats(  # noqa: PLR0913
+    hass: HomeAssistant,
+    service_point: str,
+    readings: list,
+    *,
+    consumption_only: bool = False,
+    return_only: bool = False,
+    force_import_all: bool = False,
+    is_midnight_refresh: bool = False,
+) -> None:
+    """Import 15-minute resolution AMI usage statistics."""
+    if return_only:
+        stat_id = f"{DOMAIN}:{service_point}_electric_return_15min_usage"
+        stat_name = f"{service_point} Electric Return 15-Min Usage"
+    else:
+        stat_id = f"{DOMAIN}:{service_point}_electric_15min_usage"
+        stat_name = f"{service_point} Electric 15-Min Usage"
+
+    last_sum, last_ts = await _get_last_sum_and_ts(
+        hass,
+        stat_id,
+        force_import_all=force_import_all,
+        reading_count=len(readings),
+        readings=readings,
+        is_midnight_refresh=is_midnight_refresh,
+    )
+
+    stats, running_sum = _build_15min_stat_list(
+        readings,
+        last_sum,
+        last_ts,
+        consumption_only=consumption_only,
+        return_only=return_only,
+    )
+
+    if not stats:
+        _LOGGER.info(
+            "15-min electric: no new stats to import for %s",
+            service_point,
+        )
+        return
+
+    metadata = _build_statistic_metadata(
+        stat_id,
+        stat_name,
+        UnitOfEnergy.KILO_WATT_HOUR,
+        "energy",
+    )
+    async_add_external_statistics(hass, metadata, stats)
+
+    _LOGGER.info(
+        "Imported %s 15-min AMI stats for %s (sum=%.3f)",
+        len(stats),
+        stat_id,
+        running_sum,
+    )
+
+
+def _build_15min_stat_list(
+    readings: list,
+    last_sum: float,
+    last_ts: float,
+    *,
+    consumption_only: bool = False,
+    return_only: bool = False,
+) -> tuple[list[StatisticData], float]:
+    """Build sorted StatisticData list at 15-minute resolution.
+
+    Unlike ``_build_hourly_stat_list``, this preserves the original
+    15-minute timestamps from the API instead of truncating to the hour.
+
+    Returns (stats_list, running_sum).
+    """
+    sorted_readings = sorted(
+        readings,
+        key=lambda r: str(r.get("date", "")),
+    )
+    stats: list[StatisticData] = []
+    running_sum = last_sum
+    skipped_already = 0
+    skipped_filtered = 0
+
+    for reading in sorted_readings:
+        date_str = str(reading.get("date", ""))
+        quantity = float(reading.get("quantity", 0))
+        if not date_str:
+            continue
+
+        if consumption_only and quantity < 0:
+            skipped_filtered += 1
+            continue
+        if return_only and quantity >= 0:
+            skipped_filtered += 1
+            continue
+        if return_only:
+            quantity = abs(quantity)
+
+        # Preserve 15-minute resolution (truncate_to_hour=False)
+        dt = _parse_ami_datetime(date_str, truncate_to_hour=False)
+        if dt is None:
+            continue
+
+        if dt.timestamp() <= last_ts:
+            skipped_already += 1
+            continue
+
+        running_sum += quantity
+        stats.append(StatisticData(start=dt, state=quantity, sum=running_sum))
+
+    if skipped_already > 0:
+        _LOGGER.debug(
+            "15-min: skipped %s already-imported readings",
+            skipped_already,
+        )
+    if skipped_filtered > 0:
+        label = "consumption" if consumption_only else "return"
+        _LOGGER.debug(
+            "15-min: filtered %s readings (keeping %s only)",
+            skipped_filtered,
+            label,
+        )
+
+    return stats, running_sum
 
 
 async def _import_hourly_stats(  # noqa: PLR0913
