@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
     SensorEntityDescription,
+    SensorStateClass,
 )
 
 from .const import _LOGGER, DOMAIN, UNIT_CCF, UNIT_KWH
@@ -34,6 +36,9 @@ class NationalGridSensorEntityDescription(SensorEntityDescription):
     unit_fn: Callable[[MeterData], str | None] | None = None
     device_class_fn: Callable[[MeterData], SensorDeviceClass | None] | None = None
     available_fn: Callable[[MeterData], bool] = lambda _: True
+    last_reset_fn: (
+        Callable[[NationalGridDataUpdateCoordinator, MeterData], datetime | None] | None
+    ) = None
 
 
 def _get_energy_usage(
@@ -102,13 +107,38 @@ def _get_interval_usage(
     return None
 
 
+def _get_interval_last_reset(
+    coordinator: NationalGridDataUpdateCoordinator, meter_data: MeterData
+) -> datetime | None:
+    """Get the start time of the latest interval reading as last_reset.
+
+    Each interval reading represents energy consumed during a 15-minute
+    period.  Setting last_reset to the interval start time tells HA that
+    each state value is a fresh total for that period (not cumulative).
+    """
+    sp = str(meter_data.meter.get("servicePointNumber", ""))
+    reading = coordinator.get_latest_interval_read(sp)
+    if reading:
+        start_str = reading.get("startTime", "")
+        if start_str:
+            try:
+                dt = datetime.fromisoformat(str(start_str))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=UTC)
+            except ValueError:
+                _LOGGER.debug("Could not parse interval startTime: %s", start_str)
+            else:
+                return dt
+    return None
+
+
 def _is_ami_meter(meter_data: MeterData) -> bool:
     """Check if the meter has AMI smart meter capability."""
     return bool(meter_data.meter.get("hasAmiSmartMeter"))
 
 
 def _is_electric_ami_meter(meter_data: MeterData) -> bool:
-    """Check if the meter is an electric AMI meter (interval reads are electric only)."""
+    """Check if meter is electric AMI (interval reads are electric only)."""
     return bool(meter_data.meter.get("hasAmiSmartMeter")) and str(
         meter_data.meter.get("fuelType", "")
     ).upper() != "GAS"
@@ -142,7 +172,9 @@ SENSOR_DESCRIPTIONS: tuple[NationalGridSensorEntityDescription, ...] = (
         translation_key="interval_usage",
         native_unit_of_measurement=UNIT_KWH,
         device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL,
         value_fn=_get_interval_usage,
+        last_reset_fn=_get_interval_last_reset,
         available_fn=_is_electric_ami_meter,
     ),
 )
@@ -209,3 +241,19 @@ class NationalGridSensor(NationalGridEntity, SensorEntity):
         if meter_data is None:
             return None
         return self.entity_description.value_fn(self.coordinator, meter_data)
+
+    @property
+    def last_reset(self) -> datetime | None:
+        """Return the last reset time for TOTAL state_class sensors.
+
+        For the interval_usage sensor, this returns the start time of the
+        current 15-minute interval reading.  Each reading is a fresh total
+        for that period, so last_reset changes with every state update.
+        This enables HA to compute 5-minute statistics from the entity.
+        """
+        if self.entity_description.last_reset_fn is None:
+            return None
+        meter_data = self.coordinator.get_meter_data(self._service_point_number)
+        if meter_data is None:
+            return None
+        return self.entity_description.last_reset_fn(self.coordinator, meter_data)

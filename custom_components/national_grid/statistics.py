@@ -101,7 +101,11 @@ def _resolve_hourly_stat_info(
     return stat_id, fuel, UnitOfEnergy.KILO_WATT_HOUR, "energy", name
 
 
-def _parse_ami_datetime(date_str: str, *, truncate_to_hour: bool = True) -> datetime | None:
+def _parse_ami_datetime(
+    date_str: str,
+    *,
+    truncate_to_hour: bool = True,
+) -> datetime | None:
     """Parse AMI API date string into a UTC datetime.
 
     The API returns timestamps like "2026-01-31T23:00:00.000Z" or
@@ -112,6 +116,7 @@ def _parse_ami_datetime(date_str: str, *, truncate_to_hour: bool = True) -> date
         truncate_to_hour: If True, truncate to top-of-hour for hourly
             statistics.  If False, preserve the original minute for
             15-minute resolution statistics.
+
     """
     try:
         # Strip fractional seconds and handle Z suffix
