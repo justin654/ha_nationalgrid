@@ -18,12 +18,11 @@ Import strategy:
 - First refresh: Import ALL available data (epoch to today-2)
 - Midnight refresh: Import all data in 5-day window, continuing cumulative
   sum from before the window (catches backfilled/newly available data)
-- Incremental: Interval stats only (cleared and reimported each time)
+- Incremental: Interval stats appended (upsert preserves metadata_id)
 """
 
 from __future__ import annotations
 
-import asyncio
 import re
 from datetime import UTC, datetime, timedelta
 from functools import partial
@@ -469,7 +468,7 @@ async def _import_interval_stats_electric(
 
     Interval stats cover from yesterday midnight UTC onward, picking up
     seamlessly where hourly AMI data (ending at today-2) leaves off.
-    Always clears and reimports for accuracy.
+    Uses incremental upsert to preserve stable metadata_id.
     """
     await _import_interval_stats(
         hass,
@@ -498,11 +497,40 @@ async def _import_interval_stats(
 ) -> None:
     """Import 15-min interval stats for electric meters.
 
-    Always clears and reimports from yesterday midnight UTC, which is
-    exactly where hourly AMI data (ending at today-2) leaves off.
+    Uses incremental import (upsert) so the statistics metadata_id
+    remains stable across refreshes.  Reads are bucketed into hourly
+    totals and only new hours (after the last imported timestamp) are
+    added, continuing the cumulative sum.
     """
+    if return_only:
+        stat_id = f"{DOMAIN}:{service_point}_electric_interval_return_usage"
+        stat_name = f"{service_point} Electric Interval Return Usage"
+        stat_type = "return"
+    else:
+        stat_id = f"{DOMAIN}:{service_point}_electric_interval_usage"
+        stat_name = f"{service_point} Electric Interval Usage"
+        stat_type = "consumption"
+
+    # Query last imported interval stat to continue the running sum.
+    last = await get_instance(hass).async_add_executor_job(
+        partial(
+            get_last_statistics,
+            hass,
+            1,
+            stat_id,
+            convert_units=True,
+            types={"sum"},
+        )
+    )
+    if last.get(stat_id):
+        row = last[stat_id][0]
+        last_sum = row.get("sum") or 0.0
+        last_ts = row.get("start") or 0.0
+    else:
+        last_sum = 0.0
+        last_ts = 0.0
+
     # Cutoff aligns with interval fetch start: yesterday midnight UTC.
-    # Hourly stats cover up to today-2; interval covers yesterday onward.
     now = datetime.now(tz=UTC)
     midnight_today = now.replace(
         hour=0,
@@ -513,36 +541,17 @@ async def _import_interval_stats(
     cutoff = midnight_today - timedelta(days=1)
     cutoff_ts = cutoff.timestamp()
 
-    if return_only:
-        stat_id = f"{DOMAIN}:{service_point}_electric_interval_return_usage"
-        stat_name = f"{service_point} Electric Interval Return Usage"
-        stat_type = "return"
-    else:
-        stat_id = f"{DOMAIN}:{service_point}_electric_interval_usage"
-        stat_name = f"{service_point} Electric Interval Usage"
-        stat_type = "consumption"
-
-    _LOGGER.info(
-        "Interval %s: cutoff=%s, reimporting within window",
-        stat_type,
-        cutoff.strftime("%Y-%m-%d %H:%M UTC"),
-    )
-
-    # Clear existing stats then yield to event loop
-    recorder = get_instance(hass)
-    recorder.async_clear_statistics([stat_id])
-    await asyncio.sleep(0)
-
     hourly_buckets = _bucket_interval_reads(
         reads,
         cutoff_ts,
+        last_ts,
         consumption_only=consumption_only,
         return_only=return_only,
         stat_type=stat_type,
     )
 
     stats: list[StatisticData] = []
-    running_sum = 0.0
+    running_sum = last_sum
     for hour_start in sorted(hourly_buckets):
         hour_total = hourly_buckets[hour_start]
         running_sum += hour_total
@@ -555,9 +564,10 @@ async def _import_interval_stats(
         )
 
     if not stats:
-        _LOGGER.info(
-            "Interval %s: no data within 2-day window",
+        _LOGGER.debug(
+            "Interval %s: no new data for %s",
             stat_type,
+            service_point,
         )
         return
 
@@ -570,7 +580,7 @@ async def _import_interval_stats(
     async_add_external_statistics(hass, metadata, stats)
 
     _LOGGER.info(
-        "Imported %s interval %s stats for %s (sum=%.3f, last 2 days only)",
+        "Imported %s interval %s stats for %s (sum=%.3f)",
         len(stats),
         stat_type,
         service_point,
@@ -578,9 +588,10 @@ async def _import_interval_stats(
     )
 
 
-def _bucket_interval_reads(
+def _bucket_interval_reads(  # noqa: PLR0913
     reads: list,
     cutoff_ts: float,
+    last_ts: float,
     *,
     consumption_only: bool,
     return_only: bool,
@@ -588,11 +599,22 @@ def _bucket_interval_reads(
 ) -> dict[datetime, float]:
     """Bucket interval reads into hourly totals.
 
-    Filters by direction and cutoff timestamp.
+    Filters by direction, cutoff timestamp, and already-imported hours.
+
+    Args:
+        reads: Raw interval read records from the API.
+        cutoff_ts: Earliest allowed timestamp (yesterday midnight UTC).
+        last_ts: Timestamp of the last imported statistic; hours at or
+            before this are skipped to avoid duplicates.
+        consumption_only: Keep only positive values.
+        return_only: Keep only negative values (stored as absolute).
+        stat_type: Label for log messages ("consumption" / "return").
+
     """
     hourly_buckets: dict[datetime, float] = {}
     skipped_filtered = 0
     skipped_old = 0
+    skipped_already = 0
 
     for read in reads:
         start_str = str(read.get("startTime", ""))
@@ -625,8 +647,12 @@ def _bucket_interval_reads(
             second=0,
             microsecond=0,
         )
-        if hour_start.timestamp() < cutoff_ts:
+        hour_ts = hour_start.timestamp()
+        if hour_ts < cutoff_ts:
             skipped_old += 1
+            continue
+        if hour_ts <= last_ts:
+            skipped_already += 1
             continue
 
         hourly_buckets[hour_start] = hourly_buckets.get(hour_start, 0.0) + value
@@ -639,10 +665,16 @@ def _bucket_interval_reads(
             label,
         )
     if skipped_old > 0:
-        _LOGGER.info(
+        _LOGGER.debug(
             "Interval %s: skipped %s readings older than cutoff",
             stat_type,
             skipped_old,
+        )
+    if skipped_already > 0:
+        _LOGGER.debug(
+            "Interval %s: skipped %s already-imported readings",
+            stat_type,
+            skipped_already,
         )
 
     return hourly_buckets
