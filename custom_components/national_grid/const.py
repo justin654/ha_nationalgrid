@@ -9,6 +9,7 @@ ATTRIBUTION = "Data provided by National Grid"
 
 # Config entry data keys.
 CONF_SELECTED_ACCOUNTS = "selected_accounts"
+CONF_FULL_IMPORT_DONE = "full_import_done"
 
 # Unit constants.
 UNIT_CCF = "CCF"

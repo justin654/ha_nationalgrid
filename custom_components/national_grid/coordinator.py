@@ -17,7 +17,7 @@ from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .const import _LOGGER, CONF_SELECTED_ACCOUNTS
+from .const import _LOGGER, CONF_FULL_IMPORT_DONE, CONF_SELECTED_ACCOUNTS
 
 if TYPE_CHECKING:
     import logging
@@ -97,7 +97,7 @@ class NationalGridDataUpdateCoordinator(
             session=session,
         )
         self._previous_update_success = True
-        self._is_first_refresh = True
+        self._is_first_refresh = True  # Overridden by check_full_import_done()
         self._interval_only_mode = False  # When True, only fetch interval reads
         self._is_midnight_refresh = (
             False  # When True, force full hourly import + clear interval stats
@@ -746,6 +746,26 @@ class NationalGridDataUpdateCoordinator(
         if not reads:
             return None
         return max(reads, key=lambda r: r.get("startTime", ""))
+
+    def check_full_import_done(self) -> None:
+        """Check if a full historical import was already completed.
+
+        Reads the persisted CONF_FULL_IMPORT_DONE flag from the config
+        entry.  If True, skips the expensive epoch-to-now AMI fetch on
+        boot and uses incremental (7-day) mode instead.
+
+        Must be called after ``config_entry`` is assigned.
+        """
+        if self.config_entry.data.get(CONF_FULL_IMPORT_DONE):
+            self._is_first_refresh = False
+            _LOGGER.info(
+                "Full historical import already completed — using incremental mode"
+            )
+        else:
+            _LOGGER.info(
+                "No previous full import found"
+                " — will fetch full history on first refresh"
+            )
 
     def reset_to_first_refresh(self) -> None:
         """Reset the coordinator to perform a full historical data import.

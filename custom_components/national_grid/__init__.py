@@ -13,7 +13,7 @@ from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, Platform
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.event import async_track_time_change
 
-from .const import _LOGGER, DOMAIN
+from .const import _LOGGER, CONF_FULL_IMPORT_DONE, DOMAIN
 from .coordinator import NationalGridDataUpdateCoordinator
 from .statistics import async_import_all_statistics
 
@@ -54,11 +54,32 @@ async def async_setup_entry(
         password=entry.data[CONF_PASSWORD],
     )
     coordinator.config_entry = entry
+    # Check if we already completed a full historical import.
+    # If so, skip the expensive epoch-to-now fetch on boot.
+    coordinator.check_full_import_done()
 
     entry.runtime_data = coordinator
 
     await coordinator.async_config_entry_first_refresh()
-    await async_import_all_statistics(hass, coordinator)
+
+    # Import statistics in the background so entities are available
+    # immediately.  Persist the full-import flag once complete.
+    async def _import_and_persist() -> None:
+        await async_import_all_statistics(hass, coordinator)
+        if coordinator.data and not entry.data.get(CONF_FULL_IMPORT_DONE):
+            # First full import succeeded — persist so we skip it
+            # on future reboots.
+            hass.config_entries.async_update_entry(
+                entry,
+                data={**entry.data, CONF_FULL_IMPORT_DONE: True},
+            )
+            _LOGGER.info(
+                "Persisted full_import_done flag — future boots"
+                " will use incremental mode"
+            )
+
+    hass.async_create_task(_import_and_persist())
+
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     # Re-import statistics on each coordinator update.
