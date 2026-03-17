@@ -80,6 +80,40 @@ def _get_energy_device_class(meter_data: MeterData) -> SensorDeviceClass | None:
     return SensorDeviceClass.ENERGY
 
 
+def _get_ami_hourly_usage(
+    coordinator: NationalGridDataUpdateCoordinator, meter_data: MeterData
+) -> float | None:
+    """Get the latest AMI hourly usage reading for a meter."""
+    sp = str(meter_data.meter.get("servicePointNumber", ""))
+    reading = coordinator.get_latest_ami_usage(sp)
+    if reading:
+        return reading.get("quantity")
+    return None
+
+
+def _get_interval_usage(
+    coordinator: NationalGridDataUpdateCoordinator, meter_data: MeterData
+) -> float | None:
+    """Get the latest 15-minute interval reading for a meter."""
+    sp = str(meter_data.meter.get("servicePointNumber", ""))
+    reading = coordinator.get_latest_interval_read(sp)
+    if reading:
+        return reading.get("value")
+    return None
+
+
+def _is_ami_meter(meter_data: MeterData) -> bool:
+    """Check if the meter has AMI smart meter capability."""
+    return bool(meter_data.meter.get("hasAmiSmartMeter"))
+
+
+def _is_electric_ami_meter(meter_data: MeterData) -> bool:
+    """Check if the meter is an electric AMI meter (interval reads are electric only)."""
+    return bool(meter_data.meter.get("hasAmiSmartMeter")) and str(
+        meter_data.meter.get("fuelType", "")
+    ).upper() != "GAS"
+
+
 SENSOR_DESCRIPTIONS: tuple[NationalGridSensorEntityDescription, ...] = (
     NationalGridSensorEntityDescription(
         key="energy_cost",
@@ -94,6 +128,22 @@ SENSOR_DESCRIPTIONS: tuple[NationalGridSensorEntityDescription, ...] = (
         value_fn=_get_energy_usage,
         unit_fn=_get_energy_unit,
         device_class_fn=_get_energy_device_class,
+    ),
+    NationalGridSensorEntityDescription(
+        key="ami_hourly_usage",
+        translation_key="ami_hourly_usage",
+        value_fn=_get_ami_hourly_usage,
+        unit_fn=_get_energy_unit,
+        device_class_fn=_get_energy_device_class,
+        available_fn=_is_ami_meter,
+    ),
+    NationalGridSensorEntityDescription(
+        key="interval_usage",
+        translation_key="interval_usage",
+        native_unit_of_measurement=UNIT_KWH,
+        device_class=SensorDeviceClass.ENERGY,
+        value_fn=_get_interval_usage,
+        available_fn=_is_electric_ami_meter,
     ),
 )
 

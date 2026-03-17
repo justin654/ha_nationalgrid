@@ -52,6 +52,12 @@
             },
             "energy_cost": {
                 "name": "Last Billing Cost"
+            },
+            "ami_hourly_usage": {
+                "name": "AMI Hourly Usage"
+            },
+            "interval_usage": {
+                "name": "Real-Time 15-Min Usage"
             }
         },
         "binary_sensor": {
