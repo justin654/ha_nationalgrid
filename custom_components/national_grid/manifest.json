@@ -1,13 +1,13 @@
 {
   "domain": "national_grid",
   "name": "National Grid",
-  "codeowners": ["@ryanmorash"],
+  "codeowners": ["@justin654"],
   "config_flow": true,
   "dependencies": ["recorder"],
   "documentation": "https://github.com/justin654/ha_nationalgrid",
   "integration_type": "hub",
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/justin654/ha_nationalgrid/issues",
-  "requirements": ["aionatgrid==0.4.0"],
-  "version": "0.1.3"
+  "requirements": ["aionatgrid @ git+https://github.com/justin654/aionatgrid.git"],
+  "version": "0.1.5"
 }
