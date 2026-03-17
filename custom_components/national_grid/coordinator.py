@@ -489,19 +489,13 @@ class NationalGridDataUpdateCoordinator(
                 service_point_number=sp,
                 meter_point_number=str(meter.get("meterPointNumber", "")),
             )
-            # Format dates with timezone offset to satisfy the National Grid API's
-            # .NET DateTimeOffset requirement. The API expects ISO 8601 datetime
-            # strings with offset (e.g., "2026-03-15T00:00:00.000+00:00"), not
-            # plain date strings like "2026-03-15" which .NET parses as DateTime.
-            date_from_str = f"{date_from.isoformat()}T00:00:00.000+00:00"
-            date_to_str = f"{date_to.isoformat()}T00:00:00.000+00:00"
             ami_data = await self.api.get_ami_energy_usages(
                 meter_number=ami_meter.meter_number,
                 premise_number=ami_meter.premise_number,
                 service_point_number=ami_meter.service_point_number,
                 meter_point_number=ami_meter.meter_point_number,
-                date_from=date_from_str,
-                date_to=date_to_str,
+                date_from=date_from,
+                date_to=date_to,
             )
             ami_usages[sp] = ami_data
 
@@ -510,8 +504,13 @@ class NationalGridDataUpdateCoordinator(
             CannotConnectError,
             RetryExhaustedError,
             NationalGridError,
+            ValueError,
         ) as err:
-            _LOGGER.debug(
+            # ValueError catches GraphQL server-side errors such as the
+            # known DateTimeOffset casting bug in National Grid's API.
+            # AMI hourly data is non-critical; interval reads and other
+            # data sources will still be available.
+            _LOGGER.warning(
                 "Could not fetch AMI usages for meter %s: %s",
                 sp,
                 err,
